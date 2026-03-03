@@ -87,7 +87,7 @@ Furthermore, Avro embeds the strict data schema directly within the file header 
 
 To execute this high-speed Avro ingestion, your Python script first uses Polars to write the partitioned Avro chunks to your regional Google Cloud Storage bucket. Then, you trigger the BigQuery `load_table_from_uri` job.
 
-```Python
+```python
 from google.cloud import bigquery
 
 def load_avro_from_gcs_to_bq(project_id: str, dataset_id: str, table_name: str, gcs_uri: str):
@@ -113,9 +113,6 @@ def load_avro_from_gcs_to_bq(project_id: str, dataset_id: str, table_name: str, 
     destination_table = client.get_table(table_id)
     print(f"Successfully loaded {destination_table.num_rows} rows.")
 
-# Example Invocation
-# load_avro_from_gcs_to_bq("my-project", "finance", "rbics_snapshots$20260301", "gs://my-bucket/rbics_v_*.avro")
-
 ```
 
 | Ingestion Format | Serialization Type | Compression Splittability | BigQuery Processing Logic | Relative Ingestion Speed |
@@ -131,29 +128,31 @@ While the GCS batch staging architecture using Avro is highly robust and entirel
 
 The Storage Write API represents a massive paradigm shift in cloud data ingestion, designed to replace the legacy `tabledata.insertAll` streaming method. It combines the real-time low latency of streaming inserts with the cost-efficiency and atomic guarantees of traditional batch loading.
 
-### Evaluating the Magnitude of Performance Improvement
+### Evaluating Inbound Ingestion Strategies: Avro Batch Load vs. Storage Write API
 
-The leap from traditional ingestion (like `pandas.to_gbq()` or the legacy `insertAll` API) to the Storage Write API is not marginal; it represents a generational magnitude improvement in throughput.
+To be absolutely clear, both Avro and the Storage Write API are explicitly recommended for **inbound** operations—meaning they are used for writing and inserting the 16 million transformed rows *into* BigQuery. The choice between them depends on the pipeline's tolerance for complexity versus the need for absolute minimum latency.
 
-- Legacy Streaming (insertAll): Caps out at roughly 100,000 rows per second, incurs substantial parsing overhead due to REST/JSON stringification, and carries the risk of duplicate data upon retry.
-- Storage Write API: By utilizing dense gRPC/Protocol Buffers over Tier 1 networking, a single multiplexed stream can comfortably process ~1,000,000 rows per second.
+**1. Avro (via Google Cloud Storage Batch Load)**
+This method involves the Python script saving the 16 million rows as Avro files into a Google Cloud Storage (GCS) bucket, and then triggering a BigQuery load job to ingest them.
 
-When you shift a sixteen million row pipeline from Pandas/REST to Polars/Storage Write API, the ingestion phase collapses from a brittle, multi-hour operation into an atomic transfer that takes mere seconds.
+- Performance: Avro is a row-based, binary format that BigQuery can split and read in parallel across multiple worker slots, making it the fastest file format for BigQuery batch ingestion. Because the schema is embedded directly in the file's header, BigQuery does not waste CPU cycles inferring data types. However, performance is limited by the fact that it is a two-step process: the pipeline incurs the latency of writing data to GCS first, and then waiting for BigQuery to read it from GCS.
+- Complexity: The code complexity is relatively low and well-documented, but the infrastructure complexity is moderate. You must maintain a GCS bucket, manage Google Cloud IAM permissions for that bucket, and handle the cleanup of the intermediate Avro files after the load job finishes.
+- Pros:Cost-Efficient: Batch load jobs into BigQuery from GCS are free, as they utilize a shared compute pool.Highly Reliable: It is a fully transactional and atomic operation; the load either succeeds entirely or fails entirely.Simpler Code: Writing a DataFrame to Avro and triggering a load job requires significantly less code than setting up data streams.
+- Cons:Intermediate Storage: Requires GCS as a staging area, adding moving parts to the architecture.Slower End-to-End Latency: The two-step hop (Python -> GCS -> BigQuery) is slower than direct ingestion.
 
-### Pending Streams and Atomic Commits
+**2. BigQuery Storage Write API (Pending Streams)**
+This method streams the data directly from the Python memory into BigQuery over a persistent gRPC connection, bypassing GCS entirely.
 
-For the specific scenario of processing sixteen million monthly snapshot rows, the Storage Write API should be utilized in `PENDING` mode. The API offers three stream types: Default (for real-time dashboarding), Buffered, and Pending. Pending mode is explicitly engineered for massive batch workloads.
+- Performance: The Storage Write API offers a generational leap in throughput, capable of processing roughly 1,000,000 rows per second per stream. By serializing data into dense Protocol Buffers (or Apache Arrow) and transmitting it via gRPC instead of standard REST over HTTP, it drastically reduces network payload size and completely eliminates server-side string parsing overhead.
+- Complexity: The engineering complexity is very high. It requires custom loops to serialize the data, manually manage stream states (create, append, finalize, commit), and carefully track row offsets for idempotency.
+- Pros:Direct Ingestion: Bypasses GCS entirely, offering the lowest possible latency from the GCP VM directly to BigQuery storage.Exactly-Once Semantics: By tracking stream offsets, the API guarantees that a network retry will never result in duplicate rows.Atomic Commits: Using "Pending" streams allows you to upload all 16 million rows invisibly, and then commit them all at once in a single, instantaneous transaction.
 
-In pending mode, records transmitted from the Python VM are ingested into a temporary, high-speed buffer within BigQuery. Crucially, this data remains entirely invisible to analytical queries until a final, explicit commit operation is executed. This mechanism provides absolute ACID (Atomicity, Consistency, Isolation, Durability) transactional guarantees. The Python application orchestrates this complex operation through a highly specific API flow:
-
-1. Initialization: The script invokes the CreateWriteStream method to initialize one or multiple pending streams.
-2. Streaming: The application loops through the transformed Polars DataFrame, packaging the data into Protobuf messages and dispatching them via asynchronous AppendRows calls.
-3. Finalization: Once all sixteen million rows have been transmitted, the script invokes FinalizeWriteStream to close the stream, guaranteeing no further data can be appended.
-4. Execution: Finally, the BatchCommitWriteStreams method is called. This atomic operation instantaneously moves the data from the hidden buffer into the live table. If the commit fails, the live table remains untouched, and the operation can be safely retried.
+**Summary Recommendation:**
+If the primary goal is to minimize Python engineering time and a slight delay while files stage in GCS is acceptable, **Avro** is the standard, battle-tested choice for monthly batch loads. If the goal is absolute maximum performance, lowest latency, and avoiding intermediate storage entirely, the **Storage Write API** is the enterprise-grade solution.
 
 ### Defining the Protobuf Schema Descriptor
 
-Before executing the Storage Write API Python script, you must define your BigQuery table's schema as a Protocol Buffer message. Google explicitly warns against using dynamic proto message generation in Python, as it introduces severe performance overhead.
+If you choose to use the Storage Write API with Protocol Buffers (Protobuf), you must first define your BigQuery table's schema as a Protobuf message. Google explicitly warns against using dynamic proto message generation in Python, as it introduces severe performance overhead.
 
 Instead, you must manually create a static `.proto` text file that mirrors your BigQuery schema. It is a strict architectural best practice to use `proto2` syntax for BigQuery ingestion and define all fields as `optional` (even if they are required in your BigQuery schema design).
 
@@ -178,117 +177,223 @@ message RbicsSnapshotRecord {
 
 Once defined, you must compile this file into a Python module using the Protocol Buffer Compiler (`protoc`) from your command line:
 
-```bash
+```Bash
 protoc --python_out=. rbics_schema.proto
 
 ```
 
 This command generates a static `rbics_schema_pb2.py` file. Your Python pipeline will import this generated module directly to construct the strict schema descriptor required by the gRPC stream.
 
-#### Python Implementation: Storage Write API (Pending Mode)
+### Python Implementation: Protobuf API with Garbage Collection
 
-Below is a conceptual example of how to orchestrate a pending stream batch load using the low-level `google-cloud-bigquery-storage` Python library, incorporating the compiled Protobuf schema.
+Memory consumption is a primary risk when utilizing Protobuf serialization in Python. Instantiating a massive volume of Protobuf objects creates significant Python object overhead. If the loop generates serialized batches faster than the gRPC network can transmit them, the pending requests accumulate in the VM's RAM, leading to catastrophic Out-Of-Memory (OOM) errors.
 
-```python
+To mitigate this, you must actively force Python's garbage collector to reclaim memory by explicitly deleting the Protobuf objects and the serialized strings (`del`) the exact moment they are no longer needed, and invoking `gc.collect()` at the end of every successful batch transmission.
+
+The following Python implementation demonstrates this memory-safe, dynamic batching algorithm:
+
+```Python
+import time
+import gc
 from google.cloud import bigquery_storage_v1
 from google.cloud.bigquery_storage_v1 import types
+from google.api_core import exceptions
 from google.protobuf import descriptor_pb2
 
 # Import the compiled PB2 schema generated from protoc
 import rbics_schema_pb2 
 
-def batch_load_storage_write_api(project_id: str, dataset_id: str, table_name: str, row_batches: list):
+def generate_optimal_batches(dataframe, max_bytes=8 * 1024 * 1024, max_rows=1000):
+    """
+    Algorithm to yield optimal batches based on exact Protobuf byte sizes to respect the 10MB limit.
+    """
+    current_batch =
+    current_bytes = 0
+    
+    # Assuming 'dataframe' is an iterable of rows (e.g., from Polars iter_rows)
+    for row_dict in dataframe:
+        # 1. Instantiate the Protobuf object
+        pb2_record = rbics_schema_pb2.RbicsSnapshotRecord()
+        pb2_record.entity_id = row_dict.get('entity_id')
+        #... set all other 30 fields...
+        
+        # 2. Serialize to bytes to get the exact payload size
+        serialized_record = pb2_record.SerializeToString()
+        record_size = len(serialized_record)
+        
+        # 3. Explicitly delete the python Protobuf object to free memory immediately
+        del pb2_record
+        
+        # 4. Check if adding this record breaches our optimal thresholds
+        if current_bytes + record_size > max_bytes or len(current_batch) >= max_rows:
+            yield current_batch
+            current_batch =
+            current_bytes = 0
+            
+        current_batch.append(serialized_record)
+        current_bytes += record_size
+        
+    # Yield any remaining records in the final batch
+    if current_batch:
+        yield current_batch
+
+def load_with_retries_and_gc(project_id, dataset_id, table_name, dataframe):
     write_client = bigquery_storage_v1.BigQueryWriteClient()
     parent = write_client.table_path(project_id, dataset_id, table_name)
 
-    # 1. Initialize the Pending Stream
+    # Initialize Pending Stream
     write_stream = types.WriteStream()
     write_stream.type_ = types.WriteStream.Type.PENDING
-    write_stream = write_client.create_write_stream(
-        parent=parent, write_stream=write_stream
-    )
-    print(f"Created pending stream: {write_stream.name}")
-
-    # 2. Build the Protocol Buffer Schema Descriptor
+    write_stream = write_client.create_write_stream(parent=parent, write_stream=write_stream)
+    
+    # Setup Schema Descriptor
     proto_descriptor = descriptor_pb2.DescriptorProto()
     rbics_schema_pb2.RbicsSnapshotRecord.DESCRIPTOR.CopyToProto(proto_descriptor)
-    
-    proto_schema = types.ProtoSchema()
-    proto_schema.proto_descriptor = proto_descriptor
+    proto_schema = types.ProtoSchema(proto_descriptor=proto_descriptor)
 
-    # Initialize the request template
-    request_template = types.AppendRowsRequest()
-    request_template.write_stream = write_stream.name
-    request_template.proto_rows.writer_schema = proto_schema
-
-    # 3. Open bidirectional stream and Append Rows
-    append_rows_stream = write_client.append_rows(stream=) # Managed via a generator/queue in prod
-    
+    append_rows_stream = write_client.append_rows(stream=None)
     offset = 0
-    for batch in row_batches:
+    
+    for batch_of_serialized_rows in generate_optimal_batches(dataframe):
         request = types.AppendRowsRequest()
+        request.write_stream = write_stream.name if offset == 0 else ""
+        if offset == 0:
+            request.proto_rows.writer_schema = proto_schema
+            
         request.offset = offset
         
         proto_rows = types.ProtoRows()
-        
-        # Loop through your Polars dataframe batch, instantiate the PB2 class, serialize, and append
-        # for index, row in batch.iter_rows(named=True):
-        #     pb2_record = rbics_schema_pb2.RbicsSnapshotRecord()
-        #     pb2_record.entity_id = row['entity_id']
-        #     pb2_record.revenue = row['revenue']
-        #     #... map all fields
-        #     proto_rows.serialized_rows.append(pb2_record.SerializeToString())
-            
+        proto_rows.serialized_rows = batch_of_serialized_rows
         request.proto_rows.rows = proto_rows
-        # Send the batch
-        # append_rows_stream.send(request)
-        offset += len(batch)
-        print(f"Sent {offset} rows to buffer.")
+        
+        # --- TRANSMISSION RETRY LOGIC ---
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                # Send the request and wait synchronously for the ACK to prevent queue buildup
+                append_rows_stream.send(request).result()
+                break # Success, break out of retry loop
+                
+            except exceptions.ResourceExhausted as e:
+                # Backpressure: The API is telling us to slow down
+                if attempt == max_retries - 1: raise
+                time.sleep(2 ** attempt) # Exponential backoff
+                
+            except exceptions.AlreadyExists:
+                # Idempotent safeguard: Server received the row despite transient error. Safe to ignore.
+                break 
+                
+        offset += len(batch_of_serialized_rows)
+        print(f"Successfully buffered {offset} rows.")
+        
+        # --- GARBAGE COLLECTION ---
+        # Explicitly delete the batch objects and force GC to prevent RAM overflow
+        del request
+        del proto_rows
+        del batch_of_serialized_rows
+        gc.collect()
 
-    # 4. Finalize the Stream (Locks it from further writes)
+    # Finalize the stream (locks it)
     write_client.finalize_write_stream(name=write_stream.name)
-    print("Stream finalized.")
-
-    # 5. Atomically Commit the Stream
-    commit_request = types.BatchCommitWriteStreamsRequest()
-    commit_request.parent = parent
-    commit_request.write_streams = [write_stream.name]
-    write_client.batch_commit_write_streams(request=commit_request)
     
-    print("Data committed atomically. Pipeline successful.")
+    # Atomic Commit
+    commit_request = types.BatchCommitWriteStreamsRequest(parent=parent, write_streams=[write_stream.name])
+    write_client.batch_commit_write_streams(request=commit_request)
+    print("Atomic commit successful! Data is now live.")
 
 ```
 
-### Connection Multiplexing and Idempotency
+### Alternative Implementation: Apache Arrow
 
-The second-order implication of the Storage Write API architecture is its absolute resilience to failure, achieved through exactly-once delivery semantics. Unlike legacy streaming which only offers at-least-once delivery (often resulting in duplicate records upon network retries), the Storage Write API utilizes stream offset tracking.
+If the memory overhead of Python Protobuf generation remains a bottleneck, the Storage Write API also offers native support for the Apache Arrow format. Utilizing Arrow completely bypasses the need to compile a `.proto` file and serialize row-by-row.
 
-The first request sent via `AppendRows` is assigned an offset of 0, and subsequent offsets track the total number of rows successfully ingested. If the GCP VM experiences a transient network drop, a memory spike, or a hardware preemption at row eight million, the Python script can seamlessly reconnect. By checking the last acknowledged offset, the script resumes writing from the exact point of failure, returning `ALREADY_EXISTS` errors for duplicated rows and entirely eliminating the risk of data duplication.
+Because the Polars framework is built entirely upon Apache Arrow, you can extract dense, zero-copy `RecordBatches` directly from your DataFrame and pass them straight into the BigQuery `AppendRowsRequest`.
 
-To achieve maximum throughput, the Python implementation must avoid opening and closing connections for small batches. The optimal architecture utilizes connection multiplexing, pooling connections to fully saturate the stream's capacity, aiming for a batch size of 500 to 1,000 rows per append request. By maintaining a persistent gRPC connection, the API can easily exceed throughputs of one million rows per second per stream, turning a historically bottlenecked operation into a trivial, high-speed transfer.
+#### Data Type Equivalence
 
-## Evaluating Inbound Ingestion Strategies: Avro Batch Load vs. Storage Write API
+When submitting data via Arrow, BigQuery maps PyArrow data types directly to native BigQuery schema types based on strict equivalencies. Because you don't define a Protobuf message, ensuring your DataFrame's schema precisely matches these mapped types is mandatory:
 
-To be absolutely clear, both Avro and the Storage Write API are explicitly recommended for **inbound** operations—meaning they are used for writing and inserting the 16 million transformed rows *into* BigQuery. The choice between them depends on the pipeline's tolerance for complexity versus the need for absolute minimum latency.
+- PyArrow string / Utf8 → BigQuery STRING
+- PyArrow int64 → BigQuery INT64
+- PyArrow float64 → BigQuery FLOAT64
+- PyArrow timestamp(unit='us', timezone='UTC') → BigQuery TIMESTAMP
+- PyArrow date32 → BigQuery DATE
+- PyArrow decimal128 → BigQuery NUMERIC
 
-**1. Avro (via Google Cloud Storage Batch Load)**
-This method involves the Python script saving the 16 million rows as Avro files into a Google Cloud Storage (GCS) bucket, and then triggering a BigQuery load job to ingest them.
+#### Python Implementation: Arrow Pipeline
 
-- Performance: Avro is a row-based, binary format that BigQuery can split and read in parallel across multiple worker slots, making it the fastest file format for BigQuery batch ingestion. Because the schema is embedded directly in the file's header, BigQuery does not waste CPU cycles inferring data types. However, performance is limited by the fact that it is a two-step process: the pipeline incurs the latency of writing data to GCS first, and then waiting for BigQuery to read it from GCS.
-- Complexity: The code complexity is relatively low and well-documented, but the infrastructure complexity is moderate. You must maintain a GCS bucket, manage Google Cloud IAM permissions for that bucket, and handle the cleanup of the intermediate Avro files after the load job finishes.
-- Pros:Cost-Efficient: Batch load jobs into BigQuery from GCS are free, as they utilize a shared compute pool.Highly Reliable: It is a fully transactional and atomic operation; the load either succeeds entirely or fails entirely.Simpler Code: Writing a DataFrame to Avro and triggering a load job requires significantly less code than setting up data streams.
-- Cons:Intermediate Storage: Requires GCS as a staging area, adding moving parts to the architecture.Slower End-to-End Latency: The two-step hop (Python -> GCS -> BigQuery) is slower than direct ingestion.
+```Python
+import time
+import pyarrow as pa
+from google.cloud import bigquery_storage_v1
+from google.cloud.bigquery_storage_v1 import types
+from google.api_core import exceptions
 
-**2. BigQuery Storage Write API (Pending Streams)**
-This method streams the data directly from the Python memory into BigQuery over a persistent gRPC connection, bypassing GCS entirely.
+def load_arrow_to_bq(project_id, dataset_id, table_name, polars_dataframe):
+    write_client = bigquery_storage_v1.BigQueryWriteClient()
+    parent = write_client.table_path(project_id, dataset_id, table_name)
 
-- Performance: The Storage Write API offers a generational leap in throughput, capable of processing roughly 1,000,000 rows per second per stream. By serializing data into dense Protocol Buffers (Protobuf) and transmitting it via gRPC instead of standard REST over HTTP, it drastically reduces network payload size and completely eliminates server-side string parsing overhead.
-- Complexity: The engineering complexity is very high. Implementing this requires manually defining a strict .proto schema file, compiling it into Python classes using the protoc compiler, and writing custom loops to serialize the data into Protobuf messages. It also requires manually managing stream states (create, append, finalize, commit) and tracking row offsets.
-- Pros:Direct Ingestion: Bypasses GCS entirely, offering the lowest possible latency from the GCP VM directly to BigQuery storage.Exactly-Once Semantics: By tracking stream offsets, the API guarantees that a network retry will never result in duplicate rows.Atomic Commits: Using "Pending" streams allows you to upload all 16 million rows invisibly, and then commit them all at once in a single, instantaneous transaction.
-- Cons:Steep Learning Curve: Working with gRPC and Protobufs in Python is substantially more difficult than standard data engineering tools.Maintenance Overhead: If the FactSet RBICS schema changes (e.g., a new column is added), the Protobuf schema descriptors must be manually updated and recompiled.
+    # Initialize Pending Stream
+    write_stream = types.WriteStream()
+    write_stream.type_ = types.WriteStream.Type.PENDING
+    write_stream = write_client.create_write_stream(parent=parent, write_stream=write_stream)
 
-**Summary Recommendation:**
-If the primary goal is to minimize Python engineering time and a slight delay while files stage in GCS is acceptable, **Avro** is the standard, battle-tested choice for monthly batch loads. If the goal is absolute maximum performance, lowest latency, and avoiding intermediate storage entirely, the **Storage Write API** is the enterprise-grade solution, provided the team is willing to take on the complexity of Protocol Buffers.
+    # 1. Convert Polars DataFrame natively to an Arrow Table
+    arrow_table = polars_dataframe.to_arrow()
+    
+    # 2. Extract and Serialize the Arrow Schema
+    schema = arrow_table.schema
+    serialized_schema = schema.serialize().to_pybytes()
+
+    # 3. Chunk the Arrow Table into RecordBatches (e.g., 1000 rows each)
+    batches = arrow_table.to_batches(max_chunksize=1000)
+
+    append_rows_stream = write_client.append_rows(stream=None)
+    offset = 0
+    
+    for batch in batches:
+        request = types.AppendRowsRequest()
+        request.write_stream = write_stream.name if offset == 0 else ""
+        
+        # The first request must include the serialized Arrow Schema
+        if offset == 0:
+            request.arrow_schema = types.ArrowSchema(serialized_schema=serialized_schema)
+            
+        request.offset = offset
+        
+        # 4. Write the Arrow RecordBatch to an IPC Stream for network transport
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, schema) as writer:
+            writer.write_batch(batch)
+        serialized_batch = sink.getvalue().to_pybytes()
+
+        # Assign the payload to the request
+        request.arrow_record_batch = types.ArrowRecordBatch(
+            serialized_record_batch=serialized_batch
+        )
+
+        # Send with retries
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                append_rows_stream.send(request).result()
+                break 
+            except exceptions.ResourceExhausted:
+                if attempt == max_retries - 1: raise
+                time.sleep(2 ** attempt)
+            except exceptions.AlreadyExists:
+                break 
+                
+        offset += batch.num_rows
+        print(f"Successfully buffered {offset} rows.")
+
+    # 5. Finalize and Commit
+    write_client.finalize_write_stream(name=write_stream.name)
+    commit_request = types.BatchCommitWriteStreamsRequest(parent=parent, write_streams=[write_stream.name])
+    write_client.batch_commit_write_streams(request=commit_request)
+    print("Atomic commit successful! Data is now live.")
+
+```
 
 ## BigQuery Storage Architecture for RBICS Financial Snapshots
 
@@ -329,7 +434,7 @@ Because RBICS is typically utilized for peer grouping, thematic screening, and m
 
 The following Python code utilizes the BigQuery client library to create an optimized table schema that correctly implements the monthly partition, enforces the partition filter, and establishes the optimal clustering hierarchy (incorporating the `version_id` workaround discussed above).
 
-```python
+```Python
 from google.cloud import bigquery
 
 def create_optimized_rbics_table(project_id: str, dataset_id: str, table_name: str):
@@ -337,7 +442,9 @@ def create_optimized_rbics_table(project_id: str, dataset_id: str, table_name: s
     table_id = f"{project_id}.{dataset_id}.{table_name}"
 
     # 1. Define the Schema
-    schema =
+    schema = [
+        #... your schema definitions...
+    ]
 
     table = bigquery.Table(table_id, schema=schema)
 
@@ -361,9 +468,6 @@ def create_optimized_rbics_table(project_id: str, dataset_id: str, table_name: s
         print(f"Clustered by: {table.clustering_fields}")
     except Exception as e:
         print(f"Table creation failed: {e}")
-
-# Example invocation
-# create_optimized_rbics_table("my-gcp-project", "financial_data", "rbics_revenue_snapshots")
 
 ```
 
